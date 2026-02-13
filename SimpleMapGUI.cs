@@ -33,6 +33,7 @@ namespace Oxide.Plugins
 
         private int _httpPort;
         private string _httpHost;
+        private bool _logHttp;
 
         private void GenerateMap()
         {
@@ -48,6 +49,7 @@ namespace Oxide.Plugins
             Config["HttpPort"] = DefaultHttpPort;
             Config["AutoPortFallback"] = true;
             Config["PortFallbackAttempts"] = 20;
+            Config["LogHttpRequests"] = true;
             Config["SampleIntervalSeconds"] = DefaultSampleIntervalSeconds;
             Config["FlushIntervalSeconds"] = DefaultFlushIntervalSeconds;
             Config["MaxSamplesToServe"] = DefaultMaxSamplesToServe;
@@ -87,10 +89,23 @@ namespace Oxide.Plugins
                 changed = true;
             }
 
+            if (Config["LogHttpRequests"] == null)
+            {
+                Config["LogHttpRequests"] = true;
+                changed = true;
+            }
+
             if (changed) SaveConfig();
 
             _httpHost = host;
             _httpPort = port;
+            _logHttp = Convert.ToBoolean(Config["LogHttpRequests"] ?? true);
+        }
+
+        private void LogHttp(string message)
+        {
+            if (!_logHttp) return;
+            Puts($"[HTTP] {message}");
         }
 
         private void OnServerInitialized()
@@ -711,6 +726,16 @@ namespace Oxide.Plugins
 
                 var path = (req.Url?.AbsolutePath ?? string.Empty).TrimEnd('/');
 
+                try
+                {
+                    var remote = req.RemoteEndPoint != null ? req.RemoteEndPoint.ToString() : "?";
+                    LogHttp($"{req.HttpMethod} {path} from {remote}");
+                }
+                catch
+                {
+                    // ignore logging failures
+                }
+
                 if (string.Equals(path, "/simplemap/health", StringComparison.OrdinalIgnoreCase))
                 {
                     WriteJson(res, "{\"ok\":true}");
@@ -736,6 +761,7 @@ namespace Oxide.Plugins
                 }
 
                 res.StatusCode = 404;
+                LogHttp($"404 {path}");
                 WriteText(res, "Not Found", "text/plain");
             }
             catch
@@ -743,6 +769,7 @@ namespace Oxide.Plugins
                 try
                 {
                     ctx.Response.StatusCode = 500;
+                    LogHttp("500 Internal Server Error");
                     WriteText(ctx.Response, "Internal Server Error", "text/plain");
                 }
                 catch
@@ -775,9 +802,12 @@ namespace Oxide.Plugins
             if (session == null)
             {
                 res.StatusCode = 404;
+                LogHttp($"match/{id} -> 404 not_found");
                 WriteJson(res, "{\"error\":\"not_found\"}");
                 return;
             }
+
+            LogHttp($"match/{id} -> 200 sampleCount={session.sampleCount} deaths={(session.deaths?.Count ?? 0)}");
 
             // JsonUtility doesn't serialize lists of custom classes reliably in all Unity versions, so build manually.
             // We'll use a minimal manual JSON writer to keep it robust.
@@ -807,6 +837,7 @@ namespace Oxide.Plugins
             if (session == null || string.IsNullOrWhiteSpace(session.mapPngFile))
             {
                 res.StatusCode = 404;
+                LogHttp($"match/{id}/map.png -> 404 (no session/mapPngFile)");
                 WriteText(res, "Map not found", "text/plain");
                 return;
             }
@@ -815,6 +846,7 @@ namespace Oxide.Plugins
             if (!File.Exists(full))
             {
                 res.StatusCode = 404;
+                LogHttp($"match/{id}/map.png -> 404 (file missing) {session.mapPngFile}");
                 WriteText(res, "Map not found", "text/plain");
                 return;
             }
@@ -822,6 +854,7 @@ namespace Oxide.Plugins
             var bytes = File.ReadAllBytes(full);
             res.ContentType = "image/png";
             res.StatusCode = 200;
+            LogHttp($"match/{id}/map.png -> 200 ({bytes.Length} bytes)");
             res.ContentLength64 = bytes.Length;
             res.OutputStream.Write(bytes, 0, bytes.Length);
             res.OutputStream.Flush();
