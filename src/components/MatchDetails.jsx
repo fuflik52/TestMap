@@ -213,47 +213,127 @@ export default function MatchDetails() {
 
   const apiBase = useMemo(() => RUST_API_BASE, []);
 
+  const [resolvedApiBase, setResolvedApiBase] = useState(apiBase);
+  const [apiProbe, setApiProbe] = useState({
+    base: apiBase,
+    resolved: apiBase,
+    tried: [],
+    ok: null,
+    error: null,
+  });
+
   const [activity, setActivity] = useState(null);
   const [activityError, setActivityError] = useState(null);
+  const [activityDebug, setActivityDebug] = useState({
+    url: null,
+    status: null,
+    error: null,
+    preview: null,
+    at: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const tryHealth = async (base) => {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+      try {
+        const url = `${base}/simplemap/health`;
+        const r = await fetch(url, { signal: controller.signal });
+        if (!r.ok) return { ok: false, status: r.status };
+        const j = await r.json().catch(() => null);
+        return { ok: Boolean(j?.ok), status: r.status };
+      } catch (e) {
+        return { ok: false, error: String(e?.message || e) };
+      } finally {
+        window.clearTimeout(timeoutId);
+        controller.abort();
+      }
+    };
+
+    const probe = async () => {
+      setApiProbe({ base: apiBase, resolved: apiBase, tried: [], ok: null, error: null });
+
+      let u;
+      try {
+        u = new URL(apiBase);
+      } catch {
+        setApiProbe({ base: apiBase, resolved: apiBase, tried: [], ok: false, error: "Invalid RUST_API_BASE" });
+        return;
+      }
+
+      const basePort = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+      const maxTries = 6; // 28080..28085
+      const tried = [];
+
+      for (let i = 0; i < maxTries; i++) {
+        if (cancelled) return;
+        const port = basePort + i;
+        const candidate = `${u.protocol}//${u.hostname}${port ? `:${port}` : ""}`;
+        tried.push(candidate);
+        setApiProbe((p) => ({ ...p, tried: [...tried] }));
+
+        const res = await tryHealth(candidate);
+        if (res.ok) {
+          if (cancelled) return;
+          setResolvedApiBase(candidate);
+          setApiProbe({ base: apiBase, resolved: candidate, tried: [...tried], ok: true, error: null });
+          return;
+        }
+      }
+
+      if (cancelled) return;
+      setResolvedApiBase(apiBase);
+      setApiProbe({
+        base: apiBase,
+        resolved: apiBase,
+        tried: [...tried],
+        ok: false,
+        error: "Health check failed on all tried ports",
+      });
+    };
+
+    probe();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase]);
 
   useEffect(() => {
     let cancelled = false;
     setActivity(null);
     setActivityError(null);
 
-    const url = `${apiBase}/simplemap/match/${encodeURIComponent(id)}`;
+    const url = `${resolvedApiBase}/simplemap/match/${encodeURIComponent(id)}`;
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), 12000);
 
-    // Debug logs (browser console)
-    // eslint-disable-next-line no-console
-    console.debug("[SimpleMapGUI] fetch activity:", url);
+    setActivityDebug({ url, status: null, error: null, preview: null, at: new Date().toISOString() });
 
     fetch(url, { signal: controller.signal })
       .then(async (r) => {
         const text = await r.text();
-        // eslint-disable-next-line no-console
-        console.debug("[SimpleMapGUI] activity response:", r.status, text?.slice?.(0, 300));
+        setActivityDebug((d) => ({
+          ...d,
+          status: r.status,
+          preview: (text || "").slice(0, 600),
+        }));
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return text ? JSON.parse(text) : null;
       })
       .then((data) => {
         if (cancelled) return;
         if (data && data.error) {
-          // eslint-disable-next-line no-console
-          console.debug("[SimpleMapGUI] activity not found for match:", id);
           setActivity(null);
           return;
         }
-        // eslint-disable-next-line no-console
-        console.debug("[SimpleMapGUI] activity ok:", data);
         setActivity(data);
       })
       .catch((e) => {
         if (cancelled) return;
         const msg = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
-        // eslint-disable-next-line no-console
-        console.debug("[SimpleMapGUI] activity error:", msg, e);
+        setActivityDebug((d) => ({ ...d, error: msg }));
         setActivityError(msg);
       });
 
@@ -262,7 +342,7 @@ export default function MatchDetails() {
       window.clearTimeout(timeoutId);
       controller.abort();
     };
-  }, [apiBase, id]);
+  }, [resolvedApiBase, id]);
 
   if (!match) {
     return (
@@ -292,7 +372,7 @@ export default function MatchDetails() {
         </div>
 
         <div className="mb-8">
-          <MatchActivityMap activity={activity} apiBase={apiBase} />
+          <MatchActivityMap activity={activity} apiBase={resolvedApiBase} />
           {activityError ? (
             <div className="mt-2 text-[11px] text-zinc-500">
               Activity API недоступен: <span className="font-mono">{activityError}</span>
@@ -302,6 +382,40 @@ export default function MatchDetails() {
               Нет активности для этого ID. Сначала запусти запись в игре.
             </div>
           ) : null}
+
+          <div className="mt-3 dark:bg-[#18181b] bg-white rounded-xl border dark:border-zinc-800 border-zinc-200 p-3">
+            <div className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">Debug</div>
+            <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+              apiBase: {apiBase}
+            </div>
+            <div className="text-[11px] text-zinc-500 font-mono break-all">
+              resolvedApiBase: {resolvedApiBase}
+            </div>
+            <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+              probeOk: {String(apiProbe.ok)}
+              {apiProbe.error ? ` | probeError: ${apiProbe.error}` : ""}
+            </div>
+            {apiProbe.tried?.length ? (
+              <div className="text-[11px] text-zinc-500 font-mono break-all">
+                tried: {apiProbe.tried.join(" | ")}
+              </div>
+            ) : null}
+            {activityDebug?.url ? (
+              <>
+                <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+                  url: {activityDebug.url}
+                </div>
+                <div className="text-[11px] text-zinc-500 font-mono break-all">
+                  status: {activityDebug.status ?? "-"} | error: {activityDebug.error ?? "-"}
+                </div>
+                {activityDebug.preview ? (
+                  <div className="mt-2 text-[10px] text-zinc-500 font-mono whitespace-pre-wrap break-words max-h-[160px] overflow-auto">
+                    {activityDebug.preview}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </div>
         </div>
       </div>
     );
@@ -380,12 +494,46 @@ export default function MatchDetails() {
       </div>
 
       <div className="mb-8">
-        <MatchActivityMap activity={activity} apiBase={apiBase} />
+        <MatchActivityMap activity={activity} apiBase={resolvedApiBase} />
         {activityError ? (
           <div className="mt-2 text-[11px] text-zinc-500">
             Activity API недоступен: <span className="font-mono">{activityError}</span>
           </div>
         ) : null}
+
+        <div className="mt-3 dark:bg-[#18181b] bg-white rounded-xl border dark:border-zinc-800 border-zinc-200 p-3">
+          <div className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">Debug</div>
+          <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+            apiBase: {apiBase}
+          </div>
+          <div className="text-[11px] text-zinc-500 font-mono break-all">
+            resolvedApiBase: {resolvedApiBase}
+          </div>
+          <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+            probeOk: {String(apiProbe.ok)}
+            {apiProbe.error ? ` | probeError: ${apiProbe.error}` : ""}
+          </div>
+          {apiProbe.tried?.length ? (
+            <div className="text-[11px] text-zinc-500 font-mono break-all">
+              tried: {apiProbe.tried.join(" | ")}
+            </div>
+          ) : null}
+          {activityDebug?.url ? (
+            <>
+              <div className="mt-2 text-[11px] text-zinc-500 font-mono break-all">
+                url: {activityDebug.url}
+              </div>
+              <div className="text-[11px] text-zinc-500 font-mono break-all">
+                status: {activityDebug.status ?? "-"} | error: {activityDebug.error ?? "-"}
+              </div>
+              {activityDebug.preview ? (
+                <div className="mt-2 text-[10px] text-zinc-500 font-mono whitespace-pre-wrap break-words max-h-[160px] overflow-auto">
+                  {activityDebug.preview}
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </div>
       </div>
 
       {/* Content Grid - Full Width */}
