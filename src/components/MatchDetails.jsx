@@ -218,7 +218,7 @@ export default function MatchDetails() {
     base: apiBase,
     resolved: apiBase,
     tried: [],
-    ok: null,
+    ok: "probing",
     error: null,
   });
 
@@ -243,7 +243,8 @@ export default function MatchDetails() {
         const r = await fetch(url, { signal: controller.signal });
         if (!r.ok) return { ok: false, status: r.status };
         const j = await r.json().catch(() => null);
-        return { ok: Boolean(j?.ok), status: r.status };
+        const isSimpleMap = Boolean(j?.ok) && j?.plugin === "SimpleMapGUI";
+        return { ok: isSimpleMap, status: r.status, json: j };
       } catch (e) {
         return { ok: false, error: String(e?.message || e) };
       } finally {
@@ -253,7 +254,7 @@ export default function MatchDetails() {
     };
 
     const probe = async () => {
-      setApiProbe({ base: apiBase, resolved: apiBase, tried: [], ok: null, error: null });
+      setApiProbe({ base: apiBase, resolved: apiBase, tried: [], ok: "probing", error: null });
 
       let u;
       try {

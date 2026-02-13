@@ -108,6 +108,30 @@ namespace Oxide.Plugins
             Puts($"[HTTP] {message}");
         }
 
+        private static string NormalizeMatchId(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return id;
+            id = id.Trim();
+            if (id.StartsWith("m-", StringComparison.OrdinalIgnoreCase))
+                return id.Substring(2);
+            return id;
+        }
+
+        private static IEnumerable<string> MatchIdCandidates(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) yield break;
+            id = id.Trim('/').Trim();
+
+            yield return id;
+
+            var normalized = NormalizeMatchId(id);
+            if (!string.Equals(normalized, id, StringComparison.OrdinalIgnoreCase))
+                yield return normalized;
+
+            if (!id.StartsWith("m-", StringComparison.OrdinalIgnoreCase))
+                yield return "m-" + id;
+        }
+
         private void OnServerInitialized()
         {
             StartHttp();
@@ -708,10 +732,18 @@ namespace Oxide.Plugins
 
         private void HandleHttp(HttpListenerContext ctx)
         {
+            string method = null;
+            string path = null;
+            string remote = null;
+
             try
             {
                 var req = ctx.Request;
                 var res = ctx.Response;
+
+                method = req.HttpMethod;
+                path = (req.Url?.AbsolutePath ?? string.Empty).TrimEnd('/');
+                remote = req.RemoteEndPoint != null ? req.RemoteEndPoint.ToString() : "?";
 
                 res.Headers["Access-Control-Allow-Origin"] = "*";
                 res.Headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
@@ -724,21 +756,11 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                var path = (req.Url?.AbsolutePath ?? string.Empty).TrimEnd('/');
-
-                try
-                {
-                    var remote = req.RemoteEndPoint != null ? req.RemoteEndPoint.ToString() : "?";
-                    LogHttp($"{req.HttpMethod} {path} from {remote}");
-                }
-                catch
-                {
-                    // ignore logging failures
-                }
+                LogHttp($"{method} {path} from {remote}");
 
                 if (string.Equals(path, "/simplemap/health", StringComparison.OrdinalIgnoreCase))
                 {
-                    WriteJson(res, "{\"ok\":true}");
+                    WriteJson(res, $"{{\"ok\":true,\"plugin\":\"SimpleMapGUI\",\"version\":\"{Version}\",\"port\":{_httpPort}}}");
                     return;
                 }
 
@@ -764,12 +786,24 @@ namespace Oxide.Plugins
                 LogHttp($"404 {path}");
                 WriteText(res, "Not Found", "text/plain");
             }
-            catch
+            catch (Exception ex)
             {
                 try
                 {
                     ctx.Response.StatusCode = 500;
-                    LogHttp("500 Internal Server Error");
+                    try
+                    {
+                        ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+                        ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+                        ctx.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+
+                    LogHttp($"500 {method ?? "?"} {path ?? "?"} from {remote ?? "?"} :: {ex.GetType().Name}: {ex.Message}");
+                    PrintError($"HTTP handler error for {method ?? "?"} {path ?? "?"} from {remote ?? "?"}:\n{ex}");
                     WriteText(ctx.Response, "Internal Server Error", "text/plain");
                 }
                 catch
@@ -782,16 +816,20 @@ namespace Oxide.Plugins
         private void ServeSessionJson(HttpListenerResponse res, string id)
         {
             ActivitySession session = null;
-            lock (_sync)
+            foreach (var candidate in MatchIdCandidates(id))
             {
-                _sessionsById.TryGetValue(id, out session);
-            }
+                lock (_sync)
+                {
+                    if (_sessionsById.TryGetValue(candidate, out session) && session != null)
+                        break;
+                }
 
-            if (session == null)
-            {
+                if (session != null) break;
+
                 try
                 {
-                    session = Interface.Oxide.DataFileSystem.ReadObject<ActivitySession>($"SimpleMapGUI_session_{SanitizeId(id)}");
+                    session = Interface.Oxide.DataFileSystem.ReadObject<ActivitySession>($"SimpleMapGUI_session_{SanitizeId(candidate)}");
+                    if (session != null) break;
                 }
                 catch
                 {
@@ -817,16 +855,20 @@ namespace Oxide.Plugins
         private void ServeMapPng(HttpListenerResponse res, string id)
         {
             ActivitySession session = null;
-            lock (_sync)
+            foreach (var candidate in MatchIdCandidates(id))
             {
-                _sessionsById.TryGetValue(id, out session);
-            }
+                lock (_sync)
+                {
+                    if (_sessionsById.TryGetValue(candidate, out session) && session != null)
+                        break;
+                }
 
-            if (session == null)
-            {
+                if (session != null) break;
+
                 try
                 {
-                    session = Interface.Oxide.DataFileSystem.ReadObject<ActivitySession>($"SimpleMapGUI_session_{SanitizeId(id)}");
+                    session = Interface.Oxide.DataFileSystem.ReadObject<ActivitySession>($"SimpleMapGUI_session_{SanitizeId(candidate)}");
+                    if (session != null) break;
                 }
                 catch
                 {
