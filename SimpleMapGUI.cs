@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
-using System.Threading;
+using Oxide.Core;
 using Oxide.Game.Rust.Cui;
 using UnityEngine;
 
@@ -14,13 +14,18 @@ namespace Oxide.Plugins
     {
         uint mapId;
 
+        private const string DefaultHttpHost = "+";
+        private const int DefaultHttpPort = 28080;
+
         private const string UiName = "M";
         private const float DefaultMapScale = 0.5f;
         private const int DefaultMapMargin = 500;
         private const float DefaultSampleIntervalSeconds = 1f;
+        private const float DefaultFlushIntervalSeconds = 5f;
+        private const int DefaultMaxSamplesToServe = 6000;
 
         private HttpListener _http;
-        private Thread _httpThread;
+        private System.Threading.Thread _httpThread;
         private readonly object _sync = new object();
 
         private readonly Dictionary<ulong, ActiveSession> _activeByPlayer = new Dictionary<ulong, ActiveSession>();
@@ -38,18 +43,54 @@ namespace Oxide.Plugins
 
         protected override void LoadDefaultConfig()
         {
-            // Use 127.0.0.1 for local-only; use "+" (or "*") to bind on all interfaces for external access.
-            Config["HttpHost"] = "127.0.0.1";
-            Config["HttpPort"] = 28080;
+            // Default is external access: bind on all interfaces. If you want local-only, set to 127.0.0.1.
+            Config["HttpHost"] = DefaultHttpHost;
+            Config["HttpPort"] = DefaultHttpPort;
+            Config["AutoPortFallback"] = true;
+            Config["PortFallbackAttempts"] = 20;
             Config["SampleIntervalSeconds"] = DefaultSampleIntervalSeconds;
+            Config["FlushIntervalSeconds"] = DefaultFlushIntervalSeconds;
+            Config["MaxSamplesToServe"] = DefaultMaxSamplesToServe;
             Config["MapScale"] = DefaultMapScale;
             Config["MapMargin"] = DefaultMapMargin;
         }
 
         private void Init()
         {
-            _httpHost = Convert.ToString(Config["HttpHost"]) ?? "127.0.0.1";
-            _httpPort = Convert.ToInt32(Config["HttpPort"] ?? 28080);
+            var changed = false;
+
+            var host = Convert.ToString(Config["HttpHost"]);
+            if (string.IsNullOrWhiteSpace(host) || string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) || host == "127.0.0.1")
+            {
+                host = DefaultHttpHost;
+                Config["HttpHost"] = host;
+                changed = true;
+            }
+
+            var port = Convert.ToInt32(Config["HttpPort"] ?? DefaultHttpPort);
+            if (port <= 0)
+            {
+                port = DefaultHttpPort;
+                Config["HttpPort"] = port;
+                changed = true;
+            }
+
+            // Ensure new keys exist without requiring manual config edits
+            if (Config["AutoPortFallback"] == null)
+            {
+                Config["AutoPortFallback"] = true;
+                changed = true;
+            }
+            if (Config["PortFallbackAttempts"] == null)
+            {
+                Config["PortFallbackAttempts"] = 20;
+                changed = true;
+            }
+
+            if (changed) SaveConfig();
+
+            _httpHost = host;
+            _httpPort = port;
         }
 
         private void OnServerInitialized()
@@ -63,7 +104,9 @@ namespace Oxide.Plugins
             {
                 foreach (var kv in _activeByPlayer)
                 {
-                    kv.Value?.Timer?.Destroy();
+                    kv.Value?.SampleTimer?.Destroy();
+                    kv.Value?.FlushTimer?.Destroy();
+                    FlushActive(kv.Value, finalFlush: true);
                 }
                 _activeByPlayer.Clear();
             }
@@ -200,6 +243,23 @@ namespace Oxide.Plugins
             StartSoloSession(player, matchId);
         }
 
+        [ChatCommand("solostop")]
+        private void ChatSoloStop(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+            StopSoloSession(player.userID, "manual");
+        }
+
+        [ChatCommand("solostart")]
+        private void ChatSoloStart(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+            var matchId = (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+                ? args[0]
+                : null;
+            StartSoloSession(player, matchId);
+        }
+
         [ConsoleCommand("activity.start")]
         private void ActivityStart(ConsoleSystem.Arg a)
         {
@@ -225,6 +285,9 @@ namespace Oxide.Plugins
             var interval = Convert.ToSingle(Config["SampleIntervalSeconds"] ?? DefaultSampleIntervalSeconds);
             if (interval < 0.1f) interval = 0.1f;
 
+            var flushInterval = Convert.ToSingle(Config["FlushIntervalSeconds"] ?? DefaultFlushIntervalSeconds);
+            if (flushInterval < 1f) flushInterval = 1f;
+
             var mapScale = Convert.ToSingle(Config["MapScale"] ?? DefaultMapScale);
             if (mapScale <= 0f) mapScale = DefaultMapScale;
 
@@ -242,7 +305,9 @@ namespace Oxide.Plugins
             {
                 if (_activeByPlayer.TryGetValue(player.userID, out var existing) && existing != null)
                 {
-                    existing.Timer?.Destroy();
+                    existing.SampleTimer?.Destroy();
+                    existing.FlushTimer?.Destroy();
+                    FlushActive(existing, finalFlush: true);
                     _activeByPlayer.Remove(player.userID);
                 }
 
@@ -256,15 +321,24 @@ namespace Oxide.Plugins
                     seed = seed,
                     mapScale = mapScale,
                     margin = margin,
-                    samples = new List<ActivitySample>(512),
                     deaths = new List<DeathEvent>(1),
-                    mapPngFile = EnsureMapPng(seed, worldSize, mapScale)
+                    mapPngFile = EnsureMapPng(seed, worldSize, mapScale),
+                    samplesFile = EnsureSamplesFile(sessionId),
+                    sampleCount = 0,
                 };
 
                 _sessionsById[sessionId] = session;
 
+                var active = new ActiveSession
+                {
+                    SessionId = sessionId,
+                    Session = session,
+                    Buffer = new List<ActivitySample>(256),
+                    SamplesFileFullPath = GetSamplesFileFullPath(session.samplesFile),
+                };
+
                 var startedAtMs = session.startedAt;
-                var timerHandle = timer.Every(interval, () =>
+                active.SampleTimer = timer.Every(interval, () =>
                 {
                     if (player == null || !player.IsConnected)
                     {
@@ -277,10 +351,11 @@ namespace Oxide.Plugins
                     var tSec = (float)((nowMs - startedAtMs) / 1000.0);
 
                     var uv = WorldToUv(pos.x, pos.z, worldSize, mapScale, margin);
-                    lock (_sync)
+                    lock (active)
                     {
-                        if (!_sessionsById.TryGetValue(sessionId, out var s) || s == null) return;
-                        s.samples.Add(new ActivitySample
+                        if (active.Stopped) return;
+                        active.Session.sampleCount++;
+                        active.Buffer.Add(new ActivitySample
                         {
                             t = tSec,
                             wx = pos.x,
@@ -291,14 +366,12 @@ namespace Oxide.Plugins
                     }
                 });
 
-                _activeByPlayer[player.userID] = new ActiveSession
-                {
-                    SessionId = sessionId,
-                    Timer = timerHandle,
-                };
+                active.FlushTimer = timer.Every(flushInterval, () => FlushActive(active, finalFlush: false));
+
+                _activeByPlayer[player.userID] = active;
             }
 
-            player.ChatMessage($"[Solo] Запись началась: {sessionId}. Бегай/дерись, запись остановится при смерти. Стоп: /activity.stop");
+            player.ChatMessage($"[Solo] Запись началась: {sessionId}. Бегай/дерись, запись остановится при смерти. Стоп: /solostop");
         }
 
         private void StopSoloSession(ulong userId, string reason)
@@ -306,14 +379,16 @@ namespace Oxide.Plugins
             if (userId == 0) return;
 
             ActivitySession session = null;
+            ActiveSession active = null;
             string sessionId = null;
 
             lock (_sync)
             {
-                if (_activeByPlayer.TryGetValue(userId, out var active) && active != null)
+                if (_activeByPlayer.TryGetValue(userId, out active) && active != null)
                 {
                     sessionId = active.SessionId;
-                    active.Timer?.Destroy();
+                    active.SampleTimer?.Destroy();
+                    active.FlushTimer?.Destroy();
                     _activeByPlayer.Remove(userId);
                 }
 
@@ -323,6 +398,15 @@ namespace Oxide.Plugins
                     session.endedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     session.endReason = reason;
                 }
+            }
+
+            if (active != null)
+            {
+                lock (active)
+                {
+                    active.Stopped = true;
+                }
+                FlushActive(active, finalFlush: true);
             }
 
             if (session != null)
@@ -373,6 +457,73 @@ namespace Oxide.Plugins
             }
         }
 
+        private string EnsureSamplesFile(string sessionId)
+        {
+            try
+            {
+                var dir = Path.Combine(Interface.Oxide.DataDirectory, "SimpleMapGUI", "sessions");
+                Directory.CreateDirectory(dir);
+                var file = $"samples_{SanitizeId(sessionId)}.csv";
+                var full = Path.Combine(dir, file);
+                if (!File.Exists(full))
+                {
+                    File.WriteAllText(full, "t,wx,wz,u,v\n", Encoding.UTF8);
+                }
+                return Path.Combine("sessions", file);
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Failed to create samples file: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static string GetSamplesFileFullPath(string relative)
+        {
+            if (string.IsNullOrWhiteSpace(relative)) return null;
+            return Path.Combine(Interface.Oxide.DataDirectory, "SimpleMapGUI", relative);
+        }
+
+        private void FlushActive(ActiveSession active, bool finalFlush)
+        {
+            if (active == null) return;
+
+            List<ActivitySample> batch = null;
+            string path = null;
+            lock (active)
+            {
+                if (active.Buffer == null || active.Buffer.Count == 0) return;
+                batch = new List<ActivitySample>(active.Buffer);
+                active.Buffer.Clear();
+                path = active.SamplesFileFullPath;
+            }
+
+            if (string.IsNullOrWhiteSpace(path)) return;
+
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                using (var sw = new StreamWriter(fs, Encoding.UTF8))
+                {
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        var p = batch[i];
+                        sw.Write(p.t.ToString("0.###", inv)); sw.Write(',');
+                        sw.Write(p.wx.ToString("0.###", inv)); sw.Write(',');
+                        sw.Write(p.wz.ToString("0.###", inv)); sw.Write(',');
+                        sw.Write(p.u.ToString("0.######", inv)); sw.Write(',');
+                        sw.Write(p.v.ToString("0.######", inv));
+                        sw.Write('\n');
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (finalFlush) PrintWarning($"Failed to flush samples: {ex.Message}");
+            }
+        }
+
         private static string SanitizeId(string id)
         {
             if (string.IsNullOrWhiteSpace(id)) return "unknown";
@@ -381,7 +532,7 @@ namespace Oxide.Plugins
             return id;
         }
 
-        private string EnsureMapPng(int seed, float worldSize, float mapScale)
+        private string EnsureMapPng(uint seed, float worldSize, float mapScale)
         {
             try
             {
@@ -422,27 +573,83 @@ namespace Oxide.Plugins
 
         private void StartHttp()
         {
-            try
+            StopHttp();
+
+            var host = _httpHost;
+            var basePort = _httpPort;
+            var autoFallback = Convert.ToBoolean(Config["AutoPortFallback"] ?? true);
+            var attempts = Convert.ToInt32(Config["PortFallbackAttempts"] ?? 20);
+            if (attempts < 0) attempts = 0;
+
+            for (var i = 0; i <= attempts; i++)
             {
-                StopHttp();
+                var port = basePort + i;
+                try
+                {
+                    _http = new HttpListener();
+                    _http.Prefixes.Add($"http://{host}:{port}/");
+                    _http.Start();
 
-                _http = new HttpListener();
-                _http.Prefixes.Add($"http://{_httpHost}:{_httpPort}/");
-                _http.Start();
+                    _httpPort = port;
 
-                _httpThread = new Thread(HttpLoop) { IsBackground = true };
-                _httpThread.Start();
+                    _httpThread = new System.Threading.Thread(HttpLoop) { IsBackground = true };
+                    _httpThread.Start();
 
-                Puts($"HTTP API listening on http://{_httpHost}:{_httpPort}/ (endpoints: /simplemap/health, /simplemap/match/{{id}}, /simplemap/match/{{id}}/map.png)");
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"Failed to start HTTP API: {ex.Message}. If you are on Windows, you may need to run the server as admin or change HttpHost/HttpPort in config.");
+                    if (i > 0)
+                        PrintWarning($"HTTP port {basePort} is busy; using {port} instead.");
+
+                    Puts($"HTTP API listening on http://{host}:{port}/ (endpoints: /simplemap/health, /simplemap/match/{{id}}, /simplemap/match/{{id}}/map.png)");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        _http?.Stop();
+                        _http?.Close();
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+                    finally
+                    {
+                        _http = null;
+                    }
+
+                    // If we are not allowed to fallback, fail immediately.
+                    if (!autoFallback)
+                    {
+                        PrintWarning($"Failed to start HTTP API: {ex.Message}. Change HttpHost/HttpPort in config.");
+                        return;
+                    }
+
+                    // Retry only for typical "address in use" cases; otherwise fail.
+                    var msg = ex.Message ?? string.Empty;
+                    var inUse = msg.IndexOf("Only one usage of each socket address", StringComparison.OrdinalIgnoreCase) >= 0
+                        || msg.IndexOf("Address already in use", StringComparison.OrdinalIgnoreCase) >= 0
+                        || msg.IndexOf("EADDRINUSE", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (!inUse)
+                    {
+                        PrintWarning($"Failed to start HTTP API: {ex.Message}. Change HttpHost/HttpPort in config.");
+                        return;
+                    }
+
+                    if (i >= attempts)
+                    {
+                        PrintWarning($"Failed to start HTTP API: all ports from {basePort} to {basePort + attempts} are busy.");
+                        return;
+                    }
+                }
             }
         }
 
         private void StopHttp()
         {
+            var thread = _httpThread;
+            _httpThread = null;
+
             try
             {
                 _http?.Stop();
@@ -455,6 +662,16 @@ namespace Oxide.Plugins
             finally
             {
                 _http = null;
+            }
+
+            try
+            {
+                if (thread != null && thread.IsAlive)
+                    thread.Join(1000);
+            }
+            catch
+            {
+                // ignore
             }
         }
 
@@ -642,21 +859,20 @@ namespace Oxide.Plugins
             sb.Append("\"endedAt\":").Append(s.endedAt).Append(',');
             AppendJson(sb, "endReason", s.endReason).Append(',');
             AppendJson(sb, "mapPngUrl", $"/simplemap/match/{Uri.EscapeDataString(s.id)}/map.png").Append(',');
+            sb.Append("\"sampleCount\":").Append(s.sampleCount).Append(',');
 
             sb.Append("\"samples\":[");
-            if (s.samples != null)
+            if (!string.IsNullOrWhiteSpace(s.samplesFile))
+            {
+                AppendSamplesFromFile(sb, s);
+            }
+            else if (s.samples != null)
             {
                 for (var i = 0; i < s.samples.Count; i++)
                 {
                     var p = s.samples[i];
                     if (i > 0) sb.Append(',');
-                    sb.Append('{');
-                    sb.Append("\"t\":").Append(p.t.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
-                    sb.Append("\"wx\":").Append(p.wx.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
-                    sb.Append("\"wz\":").Append(p.wz.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
-                    sb.Append("\"u\":").Append(p.u.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
-                    sb.Append("\"v\":").Append(p.v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture));
-                    sb.Append('}');
+                    AppendSampleJson(sb, p);
                 }
             }
             sb.Append("],");
@@ -681,6 +897,63 @@ namespace Oxide.Plugins
 
             sb.Append('}');
             return sb.ToString();
+        }
+
+        private static void AppendSampleJson(StringBuilder sb, ActivitySample p)
+        {
+            sb.Append('{');
+            sb.Append("\"t\":").Append(p.t.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"wx\":").Append(p.wx.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"wz\":").Append(p.wz.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"u\":").Append(p.u.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+            sb.Append("\"v\":").Append(p.v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append('}');
+        }
+
+        private static void AppendSamplesFromFile(StringBuilder sb, ActivitySession s)
+        {
+            try
+            {
+                var full = Path.Combine(Interface.Oxide.DataDirectory, "SimpleMapGUI", s.samplesFile);
+                if (!File.Exists(full)) return;
+
+                var maxSamples = DefaultMaxSamplesToServe;
+                var stride = 1;
+                if (s.sampleCount > 0)
+                {
+                    stride = Math.Max(1, s.sampleCount / maxSamples);
+                }
+
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                var idx = -1;
+                var written = 0;
+                foreach (var line in File.ReadLines(full))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (line.StartsWith("t,")) continue; // header
+                    idx++;
+                    if (stride > 1 && (idx % stride) != 0) continue;
+
+                    var parts = line.Split(',');
+                    if (parts.Length < 5) continue;
+
+                    if (written > 0) sb.Append(',');
+                    sb.Append('{');
+                    sb.Append("\"t\":").Append(parts[0]).Append(',');
+                    sb.Append("\"wx\":").Append(parts[1]).Append(',');
+                    sb.Append("\"wz\":").Append(parts[2]).Append(',');
+                    sb.Append("\"u\":").Append(parts[3]).Append(',');
+                    sb.Append("\"v\":").Append(parts[4]);
+                    sb.Append('}');
+                    written++;
+
+                    if (written >= maxSamples) break;
+                }
+            }
+            catch
+            {
+                // ignore read/parse failures
+            }
         }
 
         private static StringBuilder AppendJson(StringBuilder sb, string key, string value)
@@ -722,7 +995,12 @@ namespace Oxide.Plugins
         private class ActiveSession
         {
             public string SessionId;
-            public Oxide.Core.Libraries.Timer Timer;
+            public Oxide.Plugins.Timer SampleTimer;
+            public Oxide.Plugins.Timer FlushTimer;
+            public ActivitySession Session;
+            public List<ActivitySample> Buffer;
+            public string SamplesFileFullPath;
+            public bool Stopped;
         }
 
         [Serializable]
@@ -732,7 +1010,7 @@ namespace Oxide.Plugins
             public string playerId;
             public string playerName;
 
-            public int seed;
+            public uint seed;
             public float worldSize;
             public float mapScale;
             public int margin;
@@ -742,6 +1020,9 @@ namespace Oxide.Plugins
             public string endReason;
 
             public string mapPngFile;
+
+            public string samplesFile;
+            public int sampleCount;
 
             public List<ActivitySample> samples;
             public List<DeathEvent> deaths;
