@@ -457,6 +457,98 @@ const rawMatches = [
   },
 ];
 
+// --- Test match m-777 ---
+function generateMockActivity777() {
+  const worldSize = 4000;
+  const mapScale = 0.5;
+  const margin = 500;
+  const mapPixelSize = worldSize * mapScale + margin * 2;
+
+  const waypoints = [
+    [0.38, 0.28], [0.35, 0.35], [0.32, 0.43], [0.36, 0.50],
+    [0.42, 0.55], [0.48, 0.58], [0.53, 0.54], [0.50, 0.46],
+    [0.44, 0.40], [0.40, 0.45], [0.43, 0.52], [0.50, 0.56],
+    [0.56, 0.60], [0.58, 0.66], [0.53, 0.70], [0.47, 0.66],
+    [0.42, 0.60], [0.38, 0.55], [0.40, 0.48], [0.46, 0.44],
+    [0.52, 0.48], [0.55, 0.55], [0.58, 0.50], [0.54, 0.42],
+    [0.48, 0.38], [0.42, 0.42], [0.45, 0.50], [0.50, 0.58],
+    [0.55, 0.62], [0.52, 0.55],
+  ];
+
+  const samples = [];
+  const stepsPerSeg = 12;
+  let t = 0;
+  const seededRand = (i) => Math.sin(i * 9301 + 49297) % 1;
+
+  for (let w = 0; w < waypoints.length - 1; w++) {
+    const [u0, v0] = waypoints[w];
+    const [u1, v1] = waypoints[w + 1];
+    for (let s = 0; s < stepsPerSeg; s++) {
+      const f = s / stepsPerSeg;
+      const noise = seededRand(t) * 0.006 - 0.003;
+      const u = u0 + (u1 - u0) * f + noise;
+      const v = v0 + (v1 - v0) * f + seededRand(t + 1000) * 0.006 - 0.003;
+      const wx = (u * mapPixelSize - margin) / mapScale - worldSize / 2;
+      const wz = (v * mapPixelSize - margin) / mapScale - worldSize / 2;
+      samples.push({
+        t: +(t).toFixed(2),
+        wx: +wx.toFixed(1),
+        wz: +wz.toFixed(1),
+        u: +u.toFixed(6),
+        v: +v.toFixed(6),
+      });
+      t += 1;
+    }
+  }
+
+  return {
+    id: "m-777",
+    playerId: "76561198000000777",
+    playerName: "TestPlayer",
+    seed: 1337,
+    worldSize,
+    mapScale,
+    margin,
+    startedAt: Date.now() - 290 * 1000,
+    endedAt: Date.now(),
+    endReason: "death",
+    mapPngUrl: "/simplemap/match/m-777/map.png",
+    sampleCount: samples.length,
+    samples,
+    deaths: [
+      { at: Date.now() - 200000, wx: 100, wz: 320, u: 0.48, v: 0.58 },
+      { at: Date.now() - 120000, wx: 280, wz: 640, u: 0.56, v: 0.60 },
+      { at: Date.now() - 50000, wx: 100, wz: 800, u: 0.53, v: 0.70 },
+      { at: Date.now(), wx: 80, wz: 200, u: 0.52, v: 0.55 },
+    ],
+  };
+}
+
+export const mockActivity777 = generateMockActivity777();
+
+// m-777 match entry for the match list
+rawMatches.unshift({
+  id: "m-777",
+  timestamp: new Date().toISOString(),
+  duration: "04:50",
+  map: "Test Island",
+  score: { red: 7, blue: 3 },
+  winner: "red",
+  totalDamage: { red: 52000, blue: 31000 },
+  teams: {
+    red: [
+      { id: "r1", name: "TestPlayer", role: "Carry", damage: 28000, kills: 18, deaths: 4, assists: 5 },
+      { id: "r2", name: "AllyBot", role: "Support", damage: 12000, kills: 4, deaths: 3, assists: 15 },
+      { id: "r3", name: "TankDude", role: "Tank", damage: 12000, kills: 5, deaths: 5, assists: 8 },
+    ],
+    blue: [
+      { id: "b1", name: "Enemy1", role: "Carry", damage: 15000, kills: 10, deaths: 8, assists: 3 },
+      { id: "b2", name: "Enemy2", role: "Flex", damage: 10000, kills: 6, deaths: 7, assists: 4 },
+      { id: "b3", name: "Enemy3", role: "Healer", damage: 6000, kills: 2, deaths: 6, assists: 10 },
+    ],
+  },
+});
+
 // Apply enrichment to all players
 export const matches = rawMatches.map((match) => ({
   ...match,
