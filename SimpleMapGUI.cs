@@ -933,7 +933,7 @@ namespace Oxide.Plugins
             sb.Append("\"startedAt\":").Append(s.startedAt).Append(',');
             sb.Append("\"endedAt\":").Append(s.endedAt).Append(',');
             AppendJson(sb, "endReason", s.endReason).Append(',');
-            AppendJson(sb, "mapPngUrl", $"/simplemap/match/{Uri.EscapeDataString(s.id)}/map.png").Append(',');
+            AppendJson(sb, "mapPngUrl", $"/simplemap/match/{Uri.EscapeDataString(s.id ?? "")}/map.png").Append(',');
             sb.Append("\"sampleCount\":").Append(s.sampleCount).Append(',');
 
             sb.Append("\"samples\":[");
