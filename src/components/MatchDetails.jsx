@@ -222,42 +222,87 @@ export default function MatchDetails() {
     setActivityError(null);
 
     const url = `${apiBase}/simplemap/match/${encodeURIComponent(id)}`;
-    fetch(url)
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+
+    // Debug logs (browser console)
+    // eslint-disable-next-line no-console
+    console.debug("[SimpleMapGUI] fetch activity:", url);
+
+    fetch(url, { signal: controller.signal })
       .then(async (r) => {
+        const text = await r.text();
+        // eslint-disable-next-line no-console
+        console.debug("[SimpleMapGUI] activity response:", r.status, text?.slice?.(0, 300));
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
+        return text ? JSON.parse(text) : null;
       })
       .then((data) => {
         if (cancelled) return;
         if (data && data.error) {
+          // eslint-disable-next-line no-console
+          console.debug("[SimpleMapGUI] activity not found for match:", id);
           setActivity(null);
           return;
         }
+        // eslint-disable-next-line no-console
+        console.debug("[SimpleMapGUI] activity ok:", data);
         setActivity(data);
       })
       .catch((e) => {
         if (cancelled) return;
-        setActivityError(String(e?.message || e));
+        const msg = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
+        // eslint-disable-next-line no-console
+        console.debug("[SimpleMapGUI] activity error:", msg, e);
+        setActivityError(msg);
       });
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
     };
   }, [apiBase, id]);
 
   if (!match) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
-        <div className="w-8 h-8 rounded-full border-2 border-zinc-700 border-t-zinc-400 animate-spin" />
-        <h2 className="text-sm font-bold text-zinc-500 uppercase tracking-widest">
-          {t("searching")}
-        </h2>
-        <button
-          onClick={() => navigate("/")}
-          className="text-xs font-bold text-blue-500 hover:text-blue-400 hover:underline uppercase"
-        >
-          {t("returnHome")}
-        </button>
+      <div className="w-full animate-in fade-in zoom-in-95 duration-300 pb-20">
+        <div className="mb-6">
+          <button
+            onClick={() => navigate("/")}
+            className="flex items-center gap-1.5 text-zinc-500 dark:hover:text-white hover:text-zinc-900 transition-colors text-xs font-bold uppercase tracking-widest mb-4 pl-1"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            {t("backToMatches")}
+          </button>
+
+          <div className="dark:bg-[#18181b] bg-white border dark:border-zinc-800 border-zinc-200 shadow-sm rounded-lg overflow-hidden p-4">
+            <div className="text-xs font-bold text-zinc-500 uppercase tracking-widest">
+              Матч не найден в mock
+            </div>
+            <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              ID: <span className="font-mono">{id}</span>
+            </div>
+            <div className="mt-2 text-[11px] text-zinc-500">
+              Активность всё равно будет показана, если ты записал её в игре командой
+              <span className="font-mono"> /solo {id}</span> или
+              <span className="font-mono"> /solostart {id}</span>.
+            </div>
+          </div>
+        </div>
+
+        <div className="mb-8">
+          <MatchActivityMap activity={activity} apiBase={apiBase} />
+          {activityError ? (
+            <div className="mt-2 text-[11px] text-zinc-500">
+              Activity API недоступен: <span className="font-mono">{activityError}</span>
+            </div>
+          ) : !activity ? (
+            <div className="mt-2 text-[11px] text-zinc-500">
+              Нет активности для этого ID. Сначала запусти запись в игре.
+            </div>
+          ) : null}
+        </div>
       </div>
     );
   }
